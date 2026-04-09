@@ -1,0 +1,402 @@
+name: Azahar Nightly
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  AZAHAR_DIR: azahar-src
+
+jobs:
+  prepare:
+    name: Preparation and Changelog
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.preparation.outputs.should_build }}
+      short_sha:    ${{ steps.preparation.outputs.short_sha }}
+      full_sha:     ${{ steps.preparation.outputs.full_sha }}
+      build_date:   ${{ steps.preparation.outputs.build_date }}
+      tag_name:     ${{ steps.preparation.outputs.tag_name }}
+      prev_sha:     ${{ steps.preparation.outputs.prev_sha }}
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Check out Azahar without blobs
+        run: |
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/azahar-emu/azahar.git "$AZAHAR_DIR"
+          git -C "$AZAHAR_DIR" checkout --quiet HEAD
+
+      - name: Preparation
+        id: preparation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: bash scripts/prepare.sh "$AZAHAR_DIR"
+
+      - name: Generate changelog
+        if: steps.preparation.outputs.should_build == 'true'
+        env:
+          SHORT_SHA:  ${{ steps.preparation.outputs.short_sha }}
+          FULL_SHA:   ${{ steps.preparation.outputs.full_sha }}
+          BUILD_DATE: ${{ steps.preparation.outputs.build_date }}
+          PREV_SHA:   ${{ steps.preparation.outputs.prev_sha }}
+        run: bash scripts/changelog.sh "$AZAHAR_DIR"
+
+      - name: Upload changelog
+        if: steps.preparation.outputs.should_build == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: changelog
+          path: changelog.md
+          retention-days: 1
+  linux-x86_64:
+    name: Linux x86_64 (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["appimage", "appimage-wayland"]
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: linux
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Clone Azahar
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/azahar-emu/azahar.git "$AZAHAR_DIR"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: nightly-linux-${{ matrix.target }}-${{ needs.prepare.outputs.full_sha }}
+          restore-keys: |
+            nightly-linux-${{ matrix.target }}-
+
+      - name: Build
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/linux.sh
+
+      - name: Move AppImage to artifacts
+        run: |
+          mkdir -p artifacts
+          mv "$AZAHAR_DIR"/build/bundle/*.AppImage artifacts/
+
+      - name: Rename Wayland AppImage
+        if: matrix.target == 'appimage-wayland'
+        run: mv artifacts/azahar.AppImage artifacts/azahar-wayland.AppImage
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: artifacts/
+  linux-arm64:
+    name: Linux ARM64
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: opensauce04/azahar-build-environment:latest
+      options: -u 1001
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: linux
+      TARGET: clang
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Clone Azahar
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/azahar-emu/azahar.git "$AZAHAR_DIR"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: nightly-linux-arm64-${{ needs.prepare.outputs.full_sha }}
+          restore-keys: |
+            nightly-linux-arm64-
+
+      - name: Build
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/linux.sh
+
+      - name: Pack
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/pack.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-arm64
+          path: ${{ env.AZAHAR_DIR }}/artifacts/
+
+  macos:
+    name: macOS (Universal)
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: macos-26
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: macos
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Clone Azahar
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/azahar-emu/azahar.git "$AZAHAR_DIR"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: nightly-macos-${{ needs.prepare.outputs.full_sha }}
+          restore-keys: |
+            nightly-macos-
+
+      - name: Install tools
+        run: brew install ccache ninja spirv-tools
+
+      - name: Build (x86_64)
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: BUILD_ARCH=x86_64 bash ../.ci/macos.sh
+
+      - name: Build (arm64)
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: BUILD_ARCH=arm64 bash ../.ci/macos.sh
+
+      - name: Create universal app
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/macos-universal.sh
+
+      - name: Prepare bundle layout
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: |
+          mkdir build/bundle
+          cp -r build/x86_64/bundle  build/bundle/x86_64
+          cp -r build/arm64/bundle   build/bundle/arm64
+          cp -r build/universal/bundle build/bundle/universal
+
+      - name: Pack
+        working-directory: ${{ env.AZAHAR_DIR }}
+        env:
+          PACK_INDIVIDUALLY: 1
+        run: bash ../.ci/pack.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: ${{ env.AZAHAR_DIR }}/artifacts/
+
+  windows:
+    name: Windows (${{ matrix.target }})
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["msvc", "msys2"]
+    defaults:
+      run:
+        shell: ${{ (matrix.target == 'msys2' && 'msys2') || 'bash' }} {0}
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: windows
+      TARGET: ${{ matrix.target }}
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Set up MSYS2
+        if: matrix.target == 'msys2'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: clang64
+          update: true
+          install: git make p7zip
+          pacboy: >-
+            toolchain:p ccache:p cmake:p ninja:p spirv-tools:p
+            qt6-base:p qt6-multimedia:p qt6-multimedia-wmf:p qt6-tools:p qt6-translations:p
+
+      - name: Clone Azahar
+        shell: pwsh
+        run: |
+          git clone --recurse-submodules `
+            https://github.com/azahar-emu/azahar.git "$env:AZAHAR_DIR"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: nightly-windows-${{ matrix.target }}-${{ needs.prepare.outputs.full_sha }}
+          restore-keys: |
+            nightly-windows-${{ matrix.target }}-
+
+      - name: Set up MSVC
+        if: matrix.target == 'msvc'
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install extra tools (MSVC)
+        if: matrix.target == 'msvc'
+        run: choco install ccache ninja ptime wget
+
+      - name: Install Vulkan SDK (MSVC)
+        if: matrix.target == 'msvc'
+        run: |
+          wget https://sdk.lunarg.com/sdk/download/1.4.304.1/windows/VulkanSDK-1.4.304.1-Installer.exe \
+            -O D:/a/_temp/vulkan.exe
+          D:/a/_temp/vulkan.exe --accept-licenses --default-answer --confirm-command install
+
+      - name: Install extra tools (MSYS2)
+        if: matrix.target == 'msys2'
+        uses: crazy-max/ghaction-chocolatey@v3
+        with:
+          args: install ptime wget
+
+      - name: Disable line-ending translation
+        run: git config --global core.autocrlf input
+
+      - name: Build
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/windows.sh
+
+      - name: Pack
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: bash ../.ci/pack.sh
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.target }}
+          path: ${{ env.AZAHAR_DIR }}/artifacts/
+
+  android:
+    name: Android (vanilla)
+    needs: prepare
+    if: needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_COMPILERCHECK: content
+      CCACHE_SLOPPINESS: time_macros
+      OS: android
+      TARGET: vanilla
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Clone Azahar
+        run: |
+          git clone --recurse-submodules \
+            https://github.com/azahar-emu/azahar.git "$AZAHAR_DIR"
+
+      - name: Set up ccache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+            ${{ env.CCACHE_DIR }}
+          key: nightly-android-${{ needs.prepare.outputs.full_sha }}
+          restore-keys: |
+            nightly-android-
+
+      - name: Install tools
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install ccache apksigner -y
+
+      - name: Update Android SDK CMake
+        run: |
+          echo "y" | "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" "cmake;3.30.3"
+
+      - name: Build
+        working-directory: ${{ env.AZAHAR_DIR }}
+        run: JAVA_HOME=$JAVA_HOME_17_X64 bash ../.ci/android.sh
+        env:
+          ANDROID_KEYSTORE_B64:   ${{ secrets.ANDROID_KEYSTORE_B64 }}
+          ANDROID_KEY_ALIAS:      ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEYSTORE_PASS:  ${{ secrets.ANDROID_KEYSTORE_PASS }}
+
+      - name: Pack
+        working-directory: ${{ env.AZAHAR_DIR }}/src/android/app
+        run: bash ../../../../.ci/pack.sh
+        env:
+          UNPACKED: 1
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: android
+          path: ${{ env.AZAHAR_DIR }}/src/android/app/artifacts/
+
+  publish:
+    name: Publish Nightly Release
+    needs: [prepare, linux-x86_64, linux-arm64, macos, windows, android]
+    if: always() && needs.prepare.result == 'success' && needs.prepare.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout nightly-repo scripts
+        uses: actions/checkout@v4
+
+      - name: Download changelog
+        uses: actions/download-artifact@v4
+        with:
+          name: changelog
+          path: .
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: build-artifacts/
+          pattern: '!changelog'
+          merge-multiple: false
+
+      - name: Collect release files
+        env:
+          FULL_SHA: ${{ needs.prepare.outputs.full_sha }}
+        run: bash scripts/collect-release.sh
+
+      - name: Publish release
+        env:
+          GH_TOKEN:            ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME:            ${{ needs.prepare.outputs.tag_name }}
+          SHORT_SHA:           ${{ needs.prepare.outputs.short_sha }}
+          BUILD_DATE:          ${{ needs.prepare.outputs.build_date }}
+          GITHUB_EVENT_NAME:   ${{ github.event_name }}
+        run: bash scripts/publish-release.sh
